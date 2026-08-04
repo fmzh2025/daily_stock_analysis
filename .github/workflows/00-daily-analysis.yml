@@ -23,6 +23,9 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: write
+
 # 并发控制：同一时间只运行一个分析任务
 concurrency:
   group: stock-analysis
@@ -516,6 +519,104 @@ jobs:
           else
             python main.py $FORCE_RUN_ARG
           fi
+
+      - name: 发布 Markdown 报告到仓库 report 目录
+        id: publish_report
+        if: always()
+        run: |
+          set -euo pipefail
+
+          latest_report="$(ls -t reports/report_*.md 2>/dev/null | head -n 1 || true)"
+          if [ -z "$latest_report" ]; then
+            echo "未找到 reports/report_*.md，跳过发布"
+            exit 0
+          fi
+
+          report_name="$(basename "$latest_report")"
+          report_branch="${GITHUB_REF_NAME:-main}"
+          report_dest="report/${report_name}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin "$report_branch"
+
+          mkdir -p report
+          cp "$latest_report" "$report_dest"
+          git add "$report_dest"
+
+          if git diff --cached --quiet; then
+            echo "仓库 report 目录中的 ${report_name} 已是最新，无需提交"
+          else
+            git commit -m "chore: publish daily report ${report_name}"
+            git push origin "HEAD:${report_branch}"
+          fi
+
+          report_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${report_branch}/${report_dest}"
+          echo "report_url=${report_url}" >> "$GITHUB_OUTPUT"
+          echo "已发布报告 URL: ${report_url}"
+
+      - name: 通过 Bark 推送报告 URL
+        if: always() && steps.publish_report.outputs.report_url != ''
+        env:
+          REPORT_GITHUB_URL: ${{ steps.publish_report.outputs.report_url }}
+          BARK_WEBHOOK_URL: ${{ vars.BARK_WEBHOOK_URL || secrets.BARK_WEBHOOK_URL }}
+          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
+        run: |
+          set -euo pipefail
+
+          bark_url="${BARK_WEBHOOK_URL:-}"
+          if [ -z "$bark_url" ] && [ -n "${CUSTOM_WEBHOOK_URLS:-}" ]; then
+            IFS=',' read -ra webhook_urls <<< "$CUSTOM_WEBHOOK_URLS"
+            for webhook_url in "${webhook_urls[@]}"; do
+              trimmed_url="$(echo "$webhook_url" | xargs)"
+              case "$trimmed_url" in
+                https://api.day.app/*|http://api.day.app/*)
+                  bark_url="$trimmed_url"
+                  break
+                  ;;
+              esac
+            done
+          fi
+
+          if [ -z "$bark_url" ]; then
+            echo "未配置 BARK_WEBHOOK_URL，且 CUSTOM_WEBHOOK_URLS 中未找到 api.day.app，跳过 Bark URL 推送"
+            exit 0
+          fi
+
+          BARK_URL="$bark_url" python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          bark_url = os.environ["BARK_URL"].strip()
+          report_url = os.environ["REPORT_GITHUB_URL"].strip()
+          payload = {
+              "title": "股票分析报告",
+              "body": f"报告已生成：{report_url}",
+              "url": report_url,
+              "group": "stock",
+          }
+          data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+          request = urllib.request.Request(
+              bark_url,
+              data=data,
+              headers={"Content-Type": "application/json; charset=utf-8"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  response_text = response.read().decode("utf-8", errors="replace")
+                  if response.status != 200:
+                      print(f"Bark 推送失败: HTTP {response.status} {response_text[:500]}", file=sys.stderr)
+                      sys.exit(1)
+                  print("Bark 报告 URL 推送成功")
+          except urllib.error.HTTPError as exc:
+              response_text = exc.read().decode("utf-8", errors="replace")
+              print(f"Bark 推送失败: HTTP {exc.code} {response_text[:500]}", file=sys.stderr)
+              sys.exit(1)
+          PY
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
