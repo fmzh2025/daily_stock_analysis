@@ -338,10 +338,11 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           PUSHPLUS_TOPIC: ${{ vars.PUSHPLUS_TOPIC || secrets.PUSHPLUS_TOPIC }}
           
-          # 方式七：自定义 Webhook（钉钉、Bark、自建服务等）
-          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
-          CUSTOM_WEBHOOK_BEARER_TOKEN: ${{ secrets.CUSTOM_WEBHOOK_BEARER_TOKEN }}
-          CUSTOM_WEBHOOK_BODY_TEMPLATE: ${{ vars.CUSTOM_WEBHOOK_BODY_TEMPLATE || secrets.CUSTOM_WEBHOOK_BODY_TEMPLATE }}
+          # 方式七：自定义 Webhook 原正文推送在本 workflow 中停用；
+          # 报告上传完成后由后续 Bark 步骤单独推送 HTML 报告 URL。
+          CUSTOM_WEBHOOK_URLS: ''
+          CUSTOM_WEBHOOK_BEARER_TOKEN: ''
+          CUSTOM_WEBHOOK_BODY_TEMPLATE: ''
           WEBHOOK_VERIFY_SSL: ${{ vars.WEBHOOK_VERIFY_SSL || secrets.WEBHOOK_VERIFY_SSL || 'true' }}
           
           # 方式八：Discord
@@ -520,47 +521,289 @@ jobs:
             python main.py $FORCE_RUN_ARG
           fi
 
-      - name: 发布 Markdown 报告到仓库 report 目录
+      - name: 发布 HTML 报告到 Cloudflare R2
         id: publish_report
         if: always()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: true
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID || secrets.CF_ACCOUNT_ID }}
+          CF_R2_BUCKET: ${{ vars.CF_R2_BUCKET || secrets.CF_R2_BUCKET || 'foxhello' }}
+          CF_R2_PUBLIC_BASE_URL: ${{ vars.CF_R2_PUBLIC_BASE_URL || secrets.CF_R2_PUBLIC_BASE_URL || 'https://down.foxhello.com' }}
+          CF_R2_PREFIX: ${{ vars.CF_R2_PREFIX || secrets.CF_R2_PREFIX || 'daily_stock_analysis' }}
+          STOCK_LIST_CONFIG: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
+          WORKFLOW_MODE: ${{ github.event.inputs.mode || 'full' }}
         run: |
           set -euo pipefail
 
-          latest_report="$(ls -t reports/report_*.md 2>/dev/null | head -n 1 || true)"
-          if [ -z "$latest_report" ]; then
-            echo "未找到 reports/report_*.md，跳过发布"
-            exit 0
+          missing=0
+          for required_var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY CF_ACCOUNT_ID CF_R2_BUCKET CF_R2_PUBLIC_BASE_URL; do
+            if [ -z "${!required_var:-}" ]; then
+              echo "缺少 ${required_var}，无法上传 Cloudflare R2"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
           fi
 
-          report_name="$(basename "$latest_report")"
           report_branch="${GITHUB_REF_NAME:-main}"
-          report_dest="report/${report_name}"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin "$report_branch"
 
-          mkdir -p report
-          cp "$latest_report" "$report_dest"
-          git add "$report_dest"
+          python -m pip install awscli markdown2
 
-          if git diff --cached --quiet; then
-            echo "仓库 report 目录中的 ${report_name} 已是最新，无需提交"
-          else
-            git commit -m "chore: publish daily report ${report_name}"
-            git push origin "HEAD:${report_branch}"
+          python - <<'PY' > /tmp/r2_report_manifest.tsv
+          import html
+          import os
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import quote
+
+          try:
+              import markdown2
+          except Exception as exc:
+              print(f"markdown2 不可用，无法生成 HTML: {exc}", file=sys.stderr)
+              raise
+
+          prefix = (os.environ.get("CF_R2_PREFIX") or "daily_stock_analysis").strip().strip("/")
+          public_base_url = (os.environ.get("CF_R2_PUBLIC_BASE_URL") or "https://down.foxhello.com").strip().rstrip("/")
+          workflow_mode = (os.environ.get("WORKFLOW_MODE") or "full").strip()
+
+          raw_stock_list = os.environ.get("STOCK_LIST_CONFIG") or os.environ.get("STOCK_LIST") or ""
+          configured_stock_codes = []
+          for item in re.split(r"[,，、;；\s]+", raw_stock_list):
+              code = re.sub(r"[^A-Za-z0-9._-]", "", item.strip())
+              if code and code not in configured_stock_codes:
+                  configured_stock_codes.append(code)
+          if workflow_mode != "market-only" and not configured_stock_codes:
+              configured_stock_codes = ["600519"]
+
+          html_dir = Path("reports/html")
+          html_dir.mkdir(parents=True, exist_ok=True)
+
+          def object_key_for(*parts: str) -> str:
+              return "/".join(part.strip("/") for part in parts if part and part.strip("/"))
+
+          def extract_report_stock_codes(markdown_text: str):
+              codes = []
+              heading_code_pattern = re.compile(
+                  r"^#{2,4}\s+.*?[\(（]([A-Za-z]{0,4}\d{3,6}(?:\.[A-Za-z]{1,4})?|[A-Z]{1,6})[\)）]",
+                  re.MULTILINE,
+              )
+              for match in heading_code_pattern.finditer(markdown_text):
+                  code = match.group(1).strip()
+                  if re.fullmatch(r"\d{4}", code):
+                      continue
+                  if code and code not in codes:
+                      codes.append(code)
+              return codes
+
+          def render_html(markdown_path: Path):
+              markdown_text = markdown_path.read_text(encoding="utf-8")
+              body = markdown2.markdown(
+                  markdown_text,
+                  extras=["fenced-code-blocks", "tables", "strike", "break-on-newline"],
+              )
+              title = markdown_path.stem.replace("_", " ")
+              document = f"""<!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>{html.escape(title)}</title>
+            <style>
+              :root {{
+                color-scheme: light;
+                --fg: #1f2328;
+                --muted: #57606a;
+                --border: #d0d7de;
+                --bg: #ffffff;
+                --soft: #f6f8fa;
+                --accent: #0969da;
+              }}
+              body {{
+                margin: 0;
+                background: var(--bg);
+                color: var(--fg);
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+                font-size: 16px;
+                line-height: 1.65;
+              }}
+              main {{
+                max-width: 860px;
+                margin: 0 auto;
+                padding: 18px 16px 40px;
+              }}
+              h1, h2, h3, h4 {{
+                line-height: 1.28;
+                margin-top: 1.4em;
+                margin-bottom: .65em;
+              }}
+              h1 {{
+                font-size: 1.65rem;
+                border-bottom: 1px solid var(--border);
+                padding-bottom: .35em;
+              }}
+              h2 {{ font-size: 1.35rem; }}
+              h3 {{ font-size: 1.12rem; }}
+              p, ul, ol, blockquote, table, pre {{
+                margin-top: .75em;
+                margin-bottom: .75em;
+              }}
+              a {{
+                color: var(--accent);
+                text-decoration: none;
+              }}
+              a:hover {{ text-decoration: underline; }}
+              blockquote {{
+                margin-left: 0;
+                padding: .2em 1em;
+                color: var(--muted);
+                border-left: 4px solid var(--border);
+                background: var(--soft);
+              }}
+              table {{
+                display: block;
+                width: 100%;
+                overflow-x: auto;
+                border-collapse: collapse;
+                -webkit-overflow-scrolling: touch;
+              }}
+              th, td {{
+                border: 1px solid var(--border);
+                padding: 6px 8px;
+                vertical-align: top;
+                white-space: nowrap;
+              }}
+              th {{
+                background: var(--soft);
+                font-weight: 600;
+              }}
+              pre {{
+                overflow-x: auto;
+                padding: 12px;
+                border-radius: 6px;
+                background: var(--soft);
+              }}
+              code {{
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: .92em;
+                word-break: break-word;
+              }}
+              pre code {{
+                white-space: pre-wrap;
+              }}
+              img {{
+                max-width: 100%;
+                height: auto;
+              }}
+              hr {{
+                border: 0;
+                border-top: 1px solid var(--border);
+                margin: 1.5em 0;
+              }}
+            </style>
+          </head>
+          <body>
+            <main>
+          {body}
+            </main>
+          </body>
+          </html>
+              """
+              html_path = html_dir / f"{markdown_path.stem}.html"
+              html_path.write_text(document, encoding="utf-8")
+              return html_path, extract_report_stock_codes(markdown_text)
+
+          def object_targets(file_name: str, role_prefix: str, report_stock_codes):
+              stock_codes = report_stock_codes or configured_stock_codes
+              if workflow_mode != "market-only" and len(stock_codes) == 1:
+                  raw_targets = [(f"{role_prefix}-main", object_key_for(prefix, stock_codes[0], "report", file_name))]
+              else:
+                  raw_targets = [(f"{role_prefix}-main", object_key_for(prefix, "_daily", "report", file_name))]
+                  if workflow_mode != "market-only":
+                      raw_targets.extend(
+                          (f"{role_prefix}-copy", object_key_for(prefix, code, "report", file_name))
+                          for code in stock_codes
+                      )
+
+              targets = []
+              seen = set()
+              for role, key in raw_targets:
+                  if key not in seen:
+                      seen.add(key)
+                      targets.append((role, key))
+              return targets
+
+          rows = []
+
+          history_dir = Path("report")
+          if history_dir.exists():
+              for history_md in sorted(history_dir.glob("*.md")):
+                  html_path, report_stock_codes = render_html(history_md)
+                  for role, object_key in object_targets(html_path.name, "history", report_stock_codes):
+                      public_url = f"{public_base_url}/{quote(object_key)}"
+                      rows.append((str(html_path), object_key, public_url, role))
+
+          current_candidates = sorted(
+              Path("reports").glob("report_*.md"),
+              key=lambda p: p.stat().st_mtime,
+              reverse=True,
+          )
+          if not current_candidates:
+              current_candidates = sorted(
+                  Path("reports").glob("market_review_*.md"),
+                  key=lambda p: p.stat().st_mtime,
+                  reverse=True,
+          )
+          if current_candidates:
+              current_html, report_stock_codes = render_html(current_candidates[0])
+              for role, object_key in object_targets(current_html.name, "current", report_stock_codes):
+                  public_url = f"{public_base_url}/{quote(object_key)}"
+                  rows.append((str(current_html), object_key, public_url, role))
+
+          for row in rows:
+              print("\t".join(row))
+          PY
+
+          if [ ! -s /tmp/r2_report_manifest.tsv ]; then
+            echo "未找到可发布的 Markdown 报告，跳过 Cloudflare R2 上传"
+            exit 0
           fi
 
-          report_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${report_branch}/${report_dest}"
-          echo "report_url=${report_url}" >> "$GITHUB_OUTPUT"
-          echo "已发布报告 URL: ${report_url}"
+          while IFS=$'\t' read -r local_file object_key public_url role; do
+            aws s3 cp "$local_file" "s3://${CF_R2_BUCKET}/${object_key}" \
+              --endpoint-url "https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              --content-type "text/html; charset=utf-8" \
+              --cache-control "no-cache"
+            echo "已上传 ${object_key}: ${public_url}"
+            if [ "$role" = "current-main" ]; then
+              echo "report_url=${public_url}" >> "$GITHUB_OUTPUT"
+              echo "REPORT_PUBLIC_URL=${public_url}" >> "$GITHUB_ENV"
+            fi
+          done < /tmp/r2_report_manifest.tsv
 
-      - name: 通过 Bark 推送报告 URL
+          if [ -d report ] && find report -maxdepth 1 -type f -name '*.md' | grep -q .; then
+            git rm -r report
+            if git diff --cached --quiet; then
+              echo "历史 report 目录无可删除内容"
+            else
+              git commit -m "chore: remove GitHub report artifacts after R2 sync"
+              git push origin "HEAD:${report_branch}"
+            fi
+          fi
+
+      - name: 通过 Bark 推送 Cloudflare 报告 URL
         if: always() && steps.publish_report.outputs.report_url != ''
         env:
-          REPORT_GITHUB_URL: ${{ steps.publish_report.outputs.report_url }}
+          REPORT_PUBLIC_URL: ${{ steps.publish_report.outputs.report_url }}
           BARK_WEBHOOK_URL: ${{ vars.BARK_WEBHOOK_URL || secrets.BARK_WEBHOOK_URL }}
-          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
+          CUSTOM_WEBHOOK_URLS: ${{ vars.CUSTOM_WEBHOOK_URLS || secrets.CUSTOM_WEBHOOK_URLS }}
         run: |
           set -euo pipefail
 
@@ -570,7 +813,7 @@ jobs:
             for webhook_url in "${webhook_urls[@]}"; do
               trimmed_url="$(echo "$webhook_url" | xargs)"
               case "$trimmed_url" in
-                https://api.day.app/*|http://api.day.app/*)
+                https://api.day.app/*|http://api.day.app/*|*type=bark*)
                   bark_url="$trimmed_url"
                   break
                   ;;
@@ -589,12 +832,21 @@ jobs:
           import sys
           import urllib.error
           import urllib.request
+          from urllib.parse import urlsplit, urlunsplit
 
           bark_url = os.environ["BARK_URL"].strip()
-          report_url = os.environ["REPORT_GITHUB_URL"].strip()
+          report_url = os.environ["REPORT_PUBLIC_URL"].strip()
+
+          parsed = urlsplit(bark_url)
+          if parsed.netloc.lower() == "api.day.app":
+              parts = [part for part in parsed.path.split("/") if part]
+              if parts:
+                  bark_url = urlunsplit((parsed.scheme, parsed.netloc, f"/{parts[0]}", parsed.query, ""))
+
           payload = {
               "title": "股票分析报告",
               "body": f"报告已生成：{report_url}",
+              "msg": f"股票分析报告\n\n报告已生成：{report_url}",
               "url": report_url,
               "group": "stock",
           }
@@ -608,7 +860,7 @@ jobs:
           try:
               with urllib.request.urlopen(request, timeout=20) as response:
                   response_text = response.read().decode("utf-8", errors="replace")
-                  if response.status != 200:
+                  if not 200 <= response.status < 300:
                       print(f"Bark 推送失败: HTTP {response.status} {response_text[:500]}", file=sys.stderr)
                       sys.exit(1)
                   print("Bark 报告 URL 推送成功")
